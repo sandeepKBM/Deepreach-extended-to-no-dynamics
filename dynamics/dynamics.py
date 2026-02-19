@@ -1244,7 +1244,7 @@ class CartPole(Dynamics):
     Control: horizontal force u in [-u_max, u_max]
     """
     def __init__(
-        self, u_max: float, x_bound: float, xdot_bound: float, thetadot_bound: float,
+        self, u_max: float = None, x_bound: float = 1.0, xdot_bound: float = 1.0, thetadot_bound: float = 8.0,
         gravity: float = None, cart_mass: float = None, pole_mass: float = None, pole_length: float = None,
         set_mode: str = 'avoid', data_root: str = None, load_physics_from_data_root: bool = True
     ):
@@ -1353,9 +1353,8 @@ class CartPole(Dynamics):
         return torch.min(self.boundary_fn(state_traj), dim=-1).values
 
     def hamiltonian(self, state, dvds):
-        # Hamiltonian: max_u dvds · f(x,u)
-        # Control appears only in x_acc and theta_acc terms; approximate via finite coefficients.
-        # Use local linearization of control influence.
+        if self.u_max is None:
+            raise RuntimeError("CartPole.hamiltonian requires u_max (set --u_max for hj_pde training).")
         theta = state[..., 1]
         costheta = torch.cos(theta)
         sintheta = torch.sin(theta)
@@ -1377,6 +1376,8 @@ class CartPole(Dynamics):
         return ham_drift + ham_control
 
     def optimal_control(self, state, dvds):
+        if self.u_max is None:
+            raise RuntimeError("CartPole.optimal_control requires u_max (set --u_max for hj_pde training).")
         theta = state[..., 1]
         costheta = torch.cos(theta)
         denom = self.l * (4.0/3.0 - self.m_p * costheta**2 / self.total_mass)

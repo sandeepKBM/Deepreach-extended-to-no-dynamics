@@ -117,7 +117,7 @@ class CartPoleDataset(Dataset):
         supervised_labels_file=None, supervised_balanced_sampling=False, trajectory_uniform_sampling=False,
         max_trajectory_files=0, use_shuffled_indices_only=False, shuffled_indices_file=None,
         load_trajectories_in_ram=False,
-        training_objective='hj_pde', tc_target_mode='one_step', tc_n_step=4, tc_sample_terminal=False,
+        training_objective='hj_pde',
         angle_wrap_dims=None,
     ):
         self.dynamics = dynamics
@@ -147,20 +147,11 @@ class CartPoleDataset(Dataset):
         self.load_trajectories_in_ram = load_trajectories_in_ram
 
         self.training_objective = training_objective
-        self.tc_target_mode = tc_target_mode
-        self.tc_n_step = tc_n_step
-        self.tc_sample_terminal = tc_sample_terminal
         self.angle_wrap_dims = angle_wrap_dims if angle_wrap_dims is not None else [1]
         if self.training_objective not in ['hj_pde', 'temporal_consistency']:
             raise RuntimeError(
                 f"Unsupported training_objective={self.training_objective}. Expected 'hj_pde' or 'temporal_consistency'."
             )
-        if self.tc_target_mode not in ['one_step', 'n_step']:
-            raise RuntimeError(
-                f"Unsupported tc_target_mode={self.tc_target_mode}. Expected 'one_step' or 'n_step'."
-            )
-        if self.tc_n_step < 1:
-            raise RuntimeError("tc_n_step must be >= 1.")
         if self.training_objective == 'temporal_consistency' and self.dt <= 0:
             raise RuntimeError("Temporal consistency mode requires dt > 0 to compute observed flow.")
 

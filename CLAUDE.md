@@ -24,8 +24,8 @@ python run_experiment.py -c configs/cartpole_50k_70k.cfg --mode train
 
 # CLI arguments directly
 python run_experiment.py --mode train --experiment_class DeepReach \
-  --dynamics_class CartPole --dataset_class CartPoleDataset \
-  --data_root /path/to/data --training_objective temporal_consistency \
+  --dynamics_class CartPole --data_root /path/to/data \
+  --training_objective temporal_consistency \
   --experiment_name my_run --pretrain --pretrain_iters 50000 --num_epochs 120000
 
 # Shell launcher scripts

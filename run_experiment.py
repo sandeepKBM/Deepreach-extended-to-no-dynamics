@@ -4,7 +4,6 @@ import inspect
 import os
 import shlex
 import sys
-import warnings
 import torch
 import shutil
 import random
@@ -57,7 +56,6 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--counter_end', type=int, default=-1, required=False, help='Defines the linear step for curriculum training starting from the initial time')
     p.add_argument('--num_src_samples', type=int, default=1000, required=False, help='Number of source samples (initial-time samples) at each time step')
     p.add_argument('--num_target_samples', type=int, default=0, required=False, help='Number of samples inside the target set')
-    p.add_argument('--dataset_class', type=str, default='ReachabilityDataset', choices=['ReachabilityDataset', 'CartPoleDataset', 'Quadrotor2DDataset', 'Quadrotor3DDataset'], help='Dataset class to use.')
     p.add_argument('--data_root', type=str, default=None, help='Root directory for datasets that load from files.')
     p.add_argument('--num_supervised', type=int, default=0, required=False, help='Number of supervised samples per batch (if supported).')
     p.add_argument('--supervised_value_safe', type=float, default=-1.0, required=False, help='Supervised target value for safe label.')
@@ -73,10 +71,6 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--shuffled_indices_file', type=str, default=None, required=False, help='Optional shuffled index file path/name. If relative, resolved under --data_root.')
     p.add_argument('--load_trajectories_in_ram', action='store_true', default=False, required=False, help='For CartPoleDataset, preload selected trajectory files into RAM to reduce per-epoch file I/O.')
     p.add_argument('--training_objective', type=str, default='hj_pde', required=False, choices=['hj_pde', 'temporal_consistency'], help='Training objective: default HJ PDE residual, or observed-flow temporal PDE residual from trajectories.')
-    p.add_argument('--tc_target_mode', type=str, default='one_step', required=False, choices=['one_step', 'n_step'], help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
-    p.add_argument('--tc_n_step', type=int, default=1, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
-    p.add_argument('--tc_detach_next', default=True, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
-    p.add_argument('--tc_sample_terminal', default=False, type=bool, required=False, help='Legacy compatibility flag; ignored by observed-flow temporal consistency mode.')
 
     # model options
     p.add_argument('--model', type=str, default='sine', required=False, choices=['sine', 'tanh', 'sigmoid', 'relu'], help='Type of model to evaluate, default is sine.')
@@ -88,7 +82,6 @@ if (mode == 'all') or (mode == 'train'):
     # training options
     p.add_argument('--epochs_til_ckpt', type=int, default=1000, help='Time interval in seconds until checkpoint is saved.')
     p.add_argument('--steps_til_summary', type=int, default=100, help='Time interval in seconds until tensorboard summary is saved.')
-    p.add_argument('--batch_size', type=int, default=1, help='Batch size used during training (irrelevant, since len(dataset) == 1).')
     p.add_argument('--lr', type=float, default=2e-5, help='learning rate. default=2e-5')
     p.add_argument('--num_epochs', type=int, default=100000, help='Number of epochs to train for.')
     p.add_argument('--clip_grad', default=0.0, type=float, help='Clip gradient.')
@@ -114,7 +107,7 @@ if (mode == 'all') or (mode == 'train'):
     p.add_argument('--val_time_resolution', type=int, default=3, help='time-axis resolution of validation plot during training')
 
     # loss options
-    p.add_argument('--minWith', type=str, required=True, choices=['none', 'zero', 'target'], help='BRS vs BRT computation (typically should be using target for BRT)')
+    p.add_argument('--minWith', type=str, default='target', choices=['none', 'zero', 'target'], help='BRS vs BRT computation (typically should be using target for BRT)')
 
     # load dynamics_class choices dynamically from dynamics module
     dynamics_classes_dict = {name: clss for name, clss in inspect.getmembers(dynamics, inspect.isclass) if clss.__bases__[0] == dynamics.Dynamics}
@@ -212,23 +205,6 @@ if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency" a
     raise RuntimeError(
         "training_objective=temporal_consistency is currently supported only for CartPole, Quadrotor2D, or Quadrotor3D with trajectory-backed CartPoleDataset."
     )
-if getattr(orig_opt, "training_objective", "hj_pde") == "temporal_consistency":
-    if getattr(orig_opt, "tc_target_mode", "one_step") != "one_step":
-        warnings.warn(
-            "--tc_target_mode is ignored for observed-flow temporal consistency; one-step transitions are always used."
-        )
-    if getattr(orig_opt, "tc_n_step", 4) != 1:
-        warnings.warn(
-            "--tc_n_step is ignored for observed-flow temporal consistency; one-step transitions are always used."
-        )
-    if getattr(orig_opt, "tc_detach_next", True) is not True:
-        warnings.warn(
-            "--tc_detach_next is ignored for observed-flow temporal consistency."
-        )
-    if getattr(orig_opt, "tc_sample_terminal", False):
-        warnings.warn(
-            "--tc_sample_terminal is ignored for observed-flow temporal consistency."
-        )
 if orig_opt.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
     if orig_opt.data_root is None:
         raise RuntimeError(f'{orig_opt.dynamics_class} requires --data_root for trajectory dataset')
@@ -250,9 +226,6 @@ if orig_opt.dynamics_class in ('CartPole', 'Quadrotor2D', 'Quadrotor3D'):
         shuffled_indices_file=getattr(orig_opt, "shuffled_indices_file", None),
         load_trajectories_in_ram=getattr(orig_opt, "load_trajectories_in_ram", False),
         training_objective=getattr(orig_opt, "training_objective", "hj_pde"),
-        tc_target_mode=getattr(orig_opt, "tc_target_mode", "one_step"),
-        tc_n_step=getattr(orig_opt, "tc_n_step", 4),
-        tc_sample_terminal=getattr(orig_opt, "tc_sample_terminal", False),
     )
     if orig_opt.dynamics_class == 'Quadrotor2D':
         dataset = dataio.Quadrotor2DDataset(**_dataset_kwargs)
@@ -294,7 +267,7 @@ if (mode == 'all') or (mode == 'train'):
     else:
         raise RuntimeError(f"Unknown training objective: {training_objective}")
     experiment.train(
-        device=opt.device, batch_size=orig_opt.batch_size, epochs=orig_opt.num_epochs, lr=orig_opt.lr, 
+        device=opt.device, batch_size=1, epochs=orig_opt.num_epochs, lr=orig_opt.lr,
         steps_til_summary=orig_opt.steps_til_summary, epochs_til_checkpoint=orig_opt.epochs_til_ckpt, 
         loss_fn=loss_fn, clip_grad=orig_opt.clip_grad, use_lbfgs=orig_opt.use_lbfgs, adjust_relative_grads=orig_opt.adj_rel_grads,
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
