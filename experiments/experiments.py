@@ -50,14 +50,23 @@ class Experiment(ABC):
         state_test_range = self.dataset.dynamics.state_test_range()
         x_min, x_max = state_test_range[plot_config['x_axis_idx']]
         y_min, y_max = state_test_range[plot_config['y_axis_idx']]
-        z_min, z_max = state_test_range[plot_config['z_axis_idx']]
+
+        # Check if z_axis is distinct from x/y axes (i.e., state_dim > 2)
+        z_axis_idx = plot_config.get('z_axis_idx')
+        has_z_axis = (z_axis_idx is not None
+                      and z_axis_idx != plot_config['x_axis_idx']
+                      and z_axis_idx != plot_config['y_axis_idx'])
 
         times = torch.linspace(0, self.dataset.tMax, time_resolution)
         xs = torch.linspace(x_min, x_max, x_resolution)
         ys = torch.linspace(y_min, y_max, y_resolution)
-        zs = torch.linspace(z_min, z_max, z_resolution)
+        if has_z_axis:
+            z_min, z_max = state_test_range[z_axis_idx]
+            zs = torch.linspace(z_min, z_max, z_resolution)
+        else:
+            zs = torch.tensor([0.0])  # single dummy slice
         xys = torch.cartesian_prod(xs, ys)
-        
+
         fig = plt.figure(figsize=(5*len(times), 5*len(zs)))
         for i in range(len(times)):
             for j in range(len(zs)):
@@ -66,23 +75,58 @@ class Experiment(ABC):
                 coords[:, 1:] = torch.tensor(plot_config['state_slices'])
                 coords[:, 1 + plot_config['x_axis_idx']] = xys[:, 0]
                 coords[:, 1 + plot_config['y_axis_idx']] = xys[:, 1]
-                coords[:, 1 + plot_config['z_axis_idx']] = zs[j]
+                if has_z_axis:
+                    coords[:, 1 + z_axis_idx] = zs[j]
 
                 with torch.no_grad():
                     model_results = self.model({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
                     values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1).detach())
-                
+
                 ax = fig.add_subplot(len(times), len(zs), (j+1) + i*len(zs))
-                ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][plot_config['z_axis_idx']], zs[j]))
+                if has_z_axis:
+                    ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][z_axis_idx], zs[j]))
+                else:
+                    ax.set_title('t = %0.2f' % times[i])
                 s = ax.imshow(1*(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0), cmap='bwr', origin='lower', extent=(-1., 1., -1., 1.))
-                fig.colorbar(s) 
+                fig.colorbar(s)
         fig.savefig(save_path)
+
+        # Value function plot (continuous values)
+        value_save_path = save_path.replace('.png', '_values.png')
+        fig_val = plt.figure(figsize=(5*len(times), 5*len(zs)))
+        for i in range(len(times)):
+            for j in range(len(zs)):
+                coords = torch.zeros(x_resolution*y_resolution, self.dataset.dynamics.state_dim + 1)
+                coords[:, 0] = times[i]
+                coords[:, 1:] = torch.tensor(plot_config['state_slices'])
+                coords[:, 1 + plot_config['x_axis_idx']] = xys[:, 0]
+                coords[:, 1 + plot_config['y_axis_idx']] = xys[:, 1]
+                if has_z_axis:
+                    coords[:, 1 + z_axis_idx] = zs[j]
+
+                with torch.no_grad():
+                    model_results = self.model({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
+                    values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1).detach())
+
+                val_np = values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T
+                val_np = np.clip(val_np, -1.0, 1.0)
+                ax = fig_val.add_subplot(len(times), len(zs), (j+1) + i*len(zs))
+                if has_z_axis:
+                    ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][z_axis_idx], zs[j]))
+                else:
+                    ax.set_title('t = %0.2f' % times[i])
+                s = ax.imshow(val_np, cmap='RdBu', origin='lower', extent=(-1., 1., -1., 1.), vmin=-1.0, vmax=1.0)
+                fig_val.colorbar(s)
+        fig_val.savefig(value_save_path)
+
         if self.use_wandb:
             wandb.log({
                 'step': epoch,
                 'val_plot': wandb.Image(fig),
+                'val_values_plot': wandb.Image(fig_val),
             })
-        plt.close()
+        plt.close(fig)
+        plt.close(fig_val)
 
         if was_training:
             self.model.train()
@@ -177,6 +221,24 @@ class Experiment(ABC):
                                 model_input['tc_obs_flow'],
                                 gt['tc_boundary_values'],
                             )
+
+                            # Dirichlet loss: two-sided boundary anchor at t=0
+                            if self.dataset.num_src_samples > 0:
+                                dirichlet_mask = (curr_results['model_in'][..., 0] == self.dataset.tMin)
+                                if dirichlet_mask.any():
+                                    if self.dataset.dynamics.deepreach_model == 'exact':
+                                        # For exact model, V=l(x) at t=0 by construction,
+                                        # so |V-l| is trivially 0. Instead push raw output→0
+                                        # to prevent dvdt = 50*output from drifting unconstrained.
+                                        dirichlet_loss = torch.abs(
+                                            curr_results['model_out'].squeeze(dim=-1)[dirichlet_mask]
+                                        ).sum()
+                                    else:
+                                        # For diff/vanilla, directly anchor V = l(x) at t=0
+                                        dirichlet_loss = torch.abs(
+                                            values_curr[dirichlet_mask] - gt['tc_boundary_values'][dirichlet_mask]
+                                        ).sum()
+                                    losses['dirichlet'] = dirichlet_loss
                     else:
                         model_results = self.model({'coords': model_input['model_coords']})
 
@@ -333,6 +395,8 @@ class Experiment(ABC):
                             }
                             if 'diff_constraint_hom' in losses:
                                 wandb_payload['pde_loss'] = losses['diff_constraint_hom']
+                            if 'dirichlet' in losses:
+                                wandb_payload['dirichlet_loss'] = losses['dirichlet']
                             wandb.log(wandb_payload)
 
                     total_steps += 1
@@ -525,10 +589,13 @@ class Experiment(ABC):
 
                 if not (epoch+1) % epochs_til_checkpoint:
                     # Saving the optimizer state is important to produce consistent results
-                    checkpoint = { 
+                    checkpoint = {
                         'epoch': epoch+1,
                         'model': self.model.state_dict(),
-                        'optimizer': optim.state_dict()}
+                        'optimizer': optim.state_dict(),
+                        'tMax': self.dataset.tMax,
+                        'tMin': self.dataset.tMin,
+                    }
                     torch.save(checkpoint,
                         os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch+1)))
                     np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % (epoch+1)),

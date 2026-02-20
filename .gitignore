@@ -138,6 +138,9 @@ runs
 .tmp
 .cache
 
+# Claude Code
+.claude/
+
 # User-specific exclusions
 datasets/
 deepreach/

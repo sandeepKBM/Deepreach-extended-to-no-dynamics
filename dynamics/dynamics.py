@@ -1237,6 +1237,95 @@ class MultiVehicleCollision(Dynamics):
         }
 
 
+class Pendulum(Dynamics):
+    """
+    2D simple pendulum for temporal-consistency training with trajectory data.
+    State: [theta, theta_dot]
+    No analytical dynamics (dsdt/hamiltonian raise NotImplementedError).
+    """
+    def __init__(
+        self,
+        theta_bound: float = None,
+        thetadot_bound: float = None,
+        boundary_radius: float = 0.075,
+        set_mode: str = 'avoid',
+        data_root: str = None,
+        load_physics_from_data_root: bool = True,
+    ):
+        desc = None
+        if data_root is not None:
+            desc_path = os.path.join(data_root, "dataset_description.json")
+            if os.path.exists(desc_path):
+                with open(desc_path, "r") as f:
+                    desc = json.load(f)
+
+        if theta_bound is None:
+            theta_bound = math.pi
+        if thetadot_bound is None:
+            thetadot_bound = 2 * math.pi
+
+        if isinstance(desc, dict):
+            achieved = desc.get("achieved_bounds", {})
+            if isinstance(achieved, dict) and achieved:
+                theta_bound = _max_abs_bound(achieved, "theta", theta_bound)
+                thetadot_bound = _max_abs_bound(achieved, "theta_dot", thetadot_bound)
+
+        self.boundary_radius = boundary_radius
+
+        super().__init__(
+            loss_type='brt_hjivi', set_mode=set_mode,
+            state_dim=2, input_dim=3, control_dim=0, disturbance_dim=0,
+            state_mean=[0.0, 0.0],
+            state_var=[theta_bound, thetadot_bound],
+            value_mean=0.0,
+            value_var=1.0,
+            value_normto=0.02,
+            deepreach_model="exact",
+        )
+
+    def state_test_range(self):
+        return [
+            [-math.pi, math.pi],
+            [-self.state_var[1], self.state_var[1]],
+        ]
+
+    def equivalent_wrapped_state(self, state):
+        wrapped = torch.clone(state)
+        wrapped[..., 0] = (wrapped[..., 0] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped
+
+    def dsdt(self, state, control, disturbance):
+        raise NotImplementedError("Pendulum is for temporal_consistency only; dsdt not used.")
+
+    def boundary_fn(self, state):
+        scaled = state / (self.state_var.to(device=state.device) + 1e-12)
+        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def hamiltonian(self, state, dvds):
+        raise NotImplementedError("Pendulum is for temporal_consistency only; hamiltonian not used.")
+
+    def optimal_control(self, state, dvds):
+        raise NotImplementedError
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def plot_config(self):
+        return {
+            'state_slices': [0.0, 0.0],
+            'state_labels': ['theta', 'theta_dot'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': None,
+        }
+
+
 class CartPole(Dynamics):
     """
     CartPole dynamics for HJ PDE training.
@@ -1246,6 +1335,7 @@ class CartPole(Dynamics):
     def __init__(
         self, u_max: float = None, x_bound: float = 1.0, xdot_bound: float = 1.0, thetadot_bound: float = 8.0,
         gravity: float = None, cart_mass: float = None, pole_mass: float = None, pole_length: float = None,
+        boundary_radius: float = 0.2,
         set_mode: str = 'avoid', data_root: str = None, load_physics_from_data_root: bool = True
     ):
         desc = None
@@ -1293,6 +1383,7 @@ class CartPole(Dynamics):
         self.l = pole_length
         self.total_mass = self.m_c + self.m_p
         self.polemass_length = self.m_p * self.l
+        self.boundary_radius = boundary_radius
 
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
@@ -1344,7 +1435,7 @@ class CartPole(Dynamics):
     def boundary_fn(self, state):
         # L2 ball around the origin in normalized coordinates (negative inside).
         scaled = state / self.state_var.to(device=state.device)
-        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
+        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
 
     def sample_target_state(self, num_samples):
         raise NotImplementedError
@@ -1415,6 +1506,7 @@ class Quadrotor2D(Dynamics):
         xdot_bound: float = 1.0,
         zdot_bound: float = 1.0,
         thetadot_bound: float = 8.0,
+        boundary_radius: float = 0.3,
         set_mode: str = 'avoid',
         data_root: str = None,
         load_physics_from_data_root: bool = True,
@@ -1440,6 +1532,8 @@ class Quadrotor2D(Dynamics):
                 xdot_bound = _max_abs_bound(achieved, "x_dot", xdot_bound)
                 zdot_bound = _max_abs_bound(achieved, "z_dot", zdot_bound)
                 thetadot_bound = _max_abs_bound(achieved, "theta_dot", thetadot_bound)
+
+        self.boundary_radius = boundary_radius
 
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
@@ -1472,7 +1566,7 @@ class Quadrotor2D(Dynamics):
 
     def boundary_fn(self, state):
         scaled = state / (self.state_var.to(device=state.device) + 1e-12)
-        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
+        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
 
     def sample_target_state(self, num_samples):
         raise NotImplementedError
@@ -1524,6 +1618,7 @@ class Quadrotor3D(Dynamics):
         set_mode: str = 'avoid',
         data_root: str = None,
         load_physics_from_data_root: bool = True,
+        boundary_radius: float = 0.3,
         # Default 13D bounds (position ±1.5, quat ±1, vel ±10, omega ±10) when not loading from JSON
         x_bound: float = 1.5,
         y_bound: float = 1.5,
@@ -1582,6 +1677,8 @@ class Quadrotor3D(Dynamics):
             else:
                 state_var.append(1.0)  # fallback for unknown keys
 
+        self.boundary_radius = boundary_radius
+
         super().__init__(
             loss_type='brt_hjivi', set_mode=set_mode,
             state_dim=13, input_dim=14, control_dim=0, disturbance_dim=0,
@@ -1607,7 +1704,7 @@ class Quadrotor3D(Dynamics):
 
     def boundary_fn(self, state):
         scaled = state / (self.state_var.to(device=state.device) + 1e-12)
-        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - 0.2
+        return torch.sqrt(torch.sum(scaled ** 2, dim=-1) + 1e-12) - self.boundary_radius
 
     def sample_target_state(self, num_samples):
         raise NotImplementedError

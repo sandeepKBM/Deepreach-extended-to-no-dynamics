@@ -2,7 +2,6 @@
 import argparse
 import os
 import sys
-import pickle
 import json
 import numpy as np
 import torch
@@ -14,16 +13,17 @@ if REPO_DIR not in sys.path:
 
 from dynamics import dynamics as dynamics_mod
 from utils import modules
+from utils.config import load_experiment_config
 
 
-def load_test_set(path):
-    # expected rows: x,theta,x_dot,theta_dot, x_next,theta_next,x_dot_next,theta_dot_next, label
+def load_test_set(path, state_dim):
+    # Rows: state (state_dim cols), optionally next_state (state_dim cols), label (1 col)
     data = np.loadtxt(path, delimiter=",")
     if data.ndim == 1:
         data = data[None, :]
-    if data.shape[1] < 5:
-        raise ValueError(f"Expected >=5 columns, got {data.shape[1]}")
-    states = data[:, 0:4]
+    if data.shape[1] < state_dim + 1:
+        raise ValueError(f"Expected >={state_dim + 1} columns (state_dim={state_dim} + label), got {data.shape[1]}")
+    states = data[:, 0:state_dim]
     labels = data[:, -1]
     return states, labels
 
@@ -135,7 +135,14 @@ def resolve_timestamp_dt(timestamp_dt_arg, opt):
 
 def resolve_eval_time(args, opt):
     if args.timestamp_index is None:
-        return float(args.t_eval), None
+        if args.t_eval is not None:
+            return float(args.t_eval), None
+        # Default to tMax from training config
+        t_max = opt.get("tMax")
+        if t_max is None:
+            raise ValueError("--t_eval not provided and tMax not found in training config")
+        print(f"[eval_roa] Using t_eval={float(t_max)} from training config tMax")
+        return float(t_max), None
 
     if args.timestamp_index < 0:
         raise ValueError("--timestamp_index must be >= 0")
@@ -190,12 +197,24 @@ def optimize_threshold(values_np, y_true, metric_name, separatrix_margin=0.0, th
     return best_threshold, best_score, best_metrics
 
 
+def find_label_file(data_root, candidates):
+    """Search data_root for the first existing label file from candidates."""
+    if not data_root:
+        return None
+    for name in candidates:
+        for subdir in ["train_test_splits", ""]:
+            path = os.path.join(data_root, subdir, name) if subdir else os.path.join(data_root, name)
+            if os.path.exists(path):
+                return path
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(description="Evaluate ROA on test set and write summary to experiment folder.")
     p.add_argument("--experiment_dir", required=True, help="Path to experiment folder (runs/<experiment_name>)")
     p.add_argument("--checkpoint", default="model_final.pth", help="Checkpoint filename under training/checkpoints")
-    p.add_argument("--test_set", required=True, help="Path to test_set.txt")
-    p.add_argument("--t_eval", type=float, default=0.0, help="Evaluation time in seconds (used when --timestamp_index is not set).")
+    p.add_argument("--test_set", default=None, help="Path to test_set.txt (if omitted, searches data_root from training config)")
+    p.add_argument("--t_eval", type=float, default=None, help="Evaluation time in seconds (default: tMax from training config)")
     p.add_argument("--timestamp_index", type=int, default=None, help="Optional discrete timestamp index to evaluate (e.g. 613). If set, t_eval is computed as tMin + timestamp_index * dt.")
     p.add_argument("--timestamp_dt", type=float, default=None, help="Optional dt used with --timestamp_index. If omitted, inferred from orig_opt.dt or dataset_description.json.")
     p.add_argument("--label_safe", type=float, default=1.0, help="Label value indicating safe class (default 1)")
@@ -213,14 +232,27 @@ def main():
     if args.separatrix_margin < 0.0:
         raise ValueError("--separatrix_margin must be >= 0")
 
-    # Load original options
-    orig_path = os.path.join(args.experiment_dir, "orig_opt.pickle")
-    if not os.path.exists(orig_path):
-        raise FileNotFoundError(f"orig_opt.pickle not found in {args.experiment_dir}")
-    with open(orig_path, "rb") as f:
-        opt = pickle.load(f)
+    # Load original options (config.yaml with pickle fallback)
+    opt = load_experiment_config(args.experiment_dir)
+    data_root = opt.get("data_root")
+
+    # Resolve test_set from data_root if not provided
+    if args.test_set is None:
+        args.test_set = find_label_file(data_root, ["test_set.txt", "cal_set.txt", "roa_labels.txt"])
+        if args.test_set is None:
+            raise ValueError(
+                "--test_set not provided and no test_set.txt/cal_set.txt/roa_labels.txt found in data_root"
+            )
+        print(f"[eval_roa] Using test_set: {args.test_set}")
+
+    # Resolve cal_set from data_root if auto_threshold but no cal_set provided
+    if args.auto_threshold and args.cal_set is None:
+        args.cal_set = find_label_file(data_root, ["cal_set.txt", "test_set.txt", "roa_labels.txt"])
+        if args.cal_set is not None:
+            print(f"[eval_roa] Using cal_set: {args.cal_set}")
+
     eval_time, timestamp_info = resolve_eval_time(args, opt)
-    if hasattr(opt, "tMax") and eval_time > float(opt.tMax):
+    if "tMax" in opt and eval_time > float(opt.tMax):
         print(
             f"Warning: computed t_eval={eval_time} exceeds training tMax={float(opt.tMax)}; "
             "this uses time extrapolation.",
@@ -228,8 +260,9 @@ def main():
         )
 
     # Build dynamics
+    import inspect
     dynamics_class = getattr(dynamics_mod, opt.dynamics_class)
-    dynamics = dynamics_class(**{argname: getattr(opt, argname) for argname in dynamics_class.__init__.__code__.co_varnames if argname not in ("self",) and hasattr(opt, argname)})
+    dynamics = dynamics_class(**{argname: opt[argname] for argname in inspect.signature(dynamics_class).parameters.keys() if argname != 'self' and argname in opt})
     dynamics.deepreach_model = opt.deepreach_model
 
     # Build model
@@ -255,7 +288,7 @@ def main():
     if args.auto_threshold:
         if args.cal_set is None:
             raise ValueError("--cal_set is required when --auto_threshold is used")
-        cal_states_np, cal_labels_np = load_test_set(args.cal_set)
+        cal_states_np, cal_labels_np = load_test_set(args.cal_set, dynamics.state_dim)
         cal_true = np.where(cal_labels_np == args.label_safe, 1, 0).astype(int)
         cal_values_np = compute_values(model, dynamics, cal_states_np, eval_time, args.device)
         selected_threshold, calibration_score, calibration_metrics = optimize_threshold(
@@ -269,7 +302,7 @@ def main():
         )
 
     # Load test set and evaluate with selected threshold
-    states_np, labels_np = load_test_set(args.test_set)
+    states_np, labels_np = load_test_set(args.test_set, dynamics.state_dim)
     y_true = np.where(labels_np == args.label_safe, 1, 0).astype(int)
     values_np = compute_values(model, dynamics, states_np, eval_time, args.device)
     y_pred = predict_labels(values_np, selected_threshold, args.separatrix_margin)

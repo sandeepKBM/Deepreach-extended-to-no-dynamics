@@ -4,5 +4,5 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-python run_experiment.py -c configs/cartpole_large_X_calset_15k_6k.cfg --mode train
+python run_experiment.py -c configs/cartpole_large_X_calset_15k_6k.yaml
 

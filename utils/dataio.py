@@ -133,7 +133,7 @@ class CartPoleDataset(Dataset):
         self.num_target_samples = num_target_samples
         self.data_root = data_root
         self.dt = dt
-        self.pad_short_trajectories = True
+        self.pad_short_trajectories = (training_objective != 'temporal_consistency')
         self.required_traj_points = self._required_traj_points_for_tmax()
         self.num_supervised = num_supervised
         self.supervised_value_safe = supervised_value_safe
@@ -176,6 +176,23 @@ class CartPoleDataset(Dataset):
 
         self.traj_state_cache = None
         self.traj_lengths = None
+
+        # Auto-set tMax from raw trajectory data for TC mode
+        if self.training_objective == 'temporal_consistency':
+            raw_lengths = self._load_or_build_traj_lengths()  # returns raw since pad=False
+            max_raw_len = raw_lengths.max().item()
+            max_traj_duration = max_raw_len * self.dt
+            auto_tMax = math.floor(max_traj_duration)
+            if auto_tMax < 1:
+                auto_tMax = max_traj_duration
+            print(f"[CartPoleDataset] Max trajectory length: {max_raw_len} steps "
+                  f"({max_traj_duration:.2f}s), auto tMax: {auto_tMax}")
+            if self.tMax > max_traj_duration:
+                print(f"[CartPoleDataset] tMax={self.tMax} exceeds max trajectory duration "
+                      f"{max_traj_duration:.2f}s, setting tMax={auto_tMax}")
+            self.tMax = float(auto_tMax)
+            self.required_traj_points = self._required_traj_points_for_tmax()
+
         if self.load_trajectories_in_ram:
             self.traj_state_cache = self._load_trajectories_in_ram()
             self.traj_lengths = torch.tensor(
@@ -323,6 +340,9 @@ class CartPoleDataset(Dataset):
             'tc_model_coords_curr': torch.cat(curr_coords_list, dim=0),
             'tc_obs_flow': torch.cat(obs_flow_list, dim=0),
         }
+        # Boundary anchoring: pin last num_src_samples at tMin (matches HJ PDE path)
+        if not self.pretrain and self.num_src_samples > 0:
+            model_input['tc_model_coords_curr'][-self.num_src_samples:, 0] = self.tMin
         gt = {
             'tc_horizon': torch.cat(horizon_list, dim=0),
             'tc_boundary_values': torch.cat(boundary_list, dim=0),
@@ -352,7 +372,15 @@ class CartPoleDataset(Dataset):
             curr_states = states[start_idx]
             next_states = states[next_idx]
             boundary_vals.append(self.dynamics.boundary_fn(curr_states))
-            curr_times = start_idx.float().unsqueeze(-1) * self.dt + self.tMin
+            if self.pretrain:
+                curr_times = torch.full((k, 1), self.tMin)
+            else:
+                # Curriculum: sample time uniformly in expanding window (matching DeepReach)
+                if self.counter_end > 0:
+                    time_window = (self.tMax - self.tMin) * (self.counter / self.counter_end)
+                else:
+                    time_window = self.tMax - self.tMin
+                curr_times = self.tMin + torch.zeros(k, 1).uniform_(0, max(time_window, 1e-7))
 
             curr_coords = torch.cat((curr_times, curr_states), dim=-1)
             curr_model_coords.append(self._coord_to_model_input(curr_coords))
@@ -492,7 +520,7 @@ class CartPoleDataset(Dataset):
                 for line in f:
                     if line.strip():
                         line_count += 1
-            lengths.append(max(line_count, self.required_traj_points))
+            lengths.append(max(line_count, self.required_traj_points) if self.pad_short_trajectories else line_count)
         lengths_tensor = torch.tensor(lengths, dtype=torch.long)
         self._write_lengths_cache(cache_path, lengths_tensor)
         return lengths_tensor
@@ -515,7 +543,8 @@ class CartPoleDataset(Dataset):
             if name not in lengths_by_name:
                 return None
             lengths.append(lengths_by_name[name])
-        lengths = [max(length, self.required_traj_points) for length in lengths]
+        if self.pad_short_trajectories:
+            lengths = [max(length, self.required_traj_points) for length in lengths]
         return torch.tensor(lengths, dtype=torch.long)
 
     def _write_lengths_cache(self, cache_path, lengths_tensor):
@@ -586,4 +615,11 @@ class Quadrotor3DDataset(CartPoleDataset):
     """CartPoleDataset with no angle wrapping (quaternion representation)."""
     def __init__(self, **kwargs):
         kwargs.setdefault('angle_wrap_dims', [])
+        super().__init__(**kwargs)
+
+
+class PendulumDataset(CartPoleDataset):
+    """CartPoleDataset with angle wrapping on dimension 0 (theta for 2D pendulum)."""
+    def __init__(self, **kwargs):
+        kwargs.setdefault('angle_wrap_dims', [0])
         super().__init__(**kwargs)
